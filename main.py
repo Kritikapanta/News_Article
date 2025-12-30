@@ -1,205 +1,225 @@
 import requests
+import feedparser
 import numpy as np
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 # =========================
 # CONFIG
 # =========================
 NEWS_API_KEY = "12ad376c3d5c4134b493484d2711eb14"
 ARTICLES_PER_QUERY = 50
-RESULTS_PER_PAGE = 10 
+RESULTS_PER_PAGE = 10
+
+NEPALI_SITES = [
+    "onlinekhabar.com",
+    "kantipurdaily.com",
+    "setopati.com",
+    "nagariknews.nagariknetwork.com",
+    "annapurnapost.com",
+    "ratopati.com"
+    "ronbpost.com"
+]
+
+LOCAL_KEYWORDS = [
+    "nepal", "kathmandu", "pokhara", "lalitpur",
+    "butwal", "biratnagar", "birgunj",
+    "province", "palika",
+    "नेपाल", "काठमाडौं", "पोखरा"
+]
 
 # =========================
-# PREPROCESSING
+# UTILITIES
 # =========================
 def preprocess(text):
     return re.findall(r"\b\w+\b", str(text).lower())
 
+def is_local_query(query):
+    q = query.lower()
+    return any(k in q for k in LOCAL_KEYWORDS)
+
+def time_decay(published_at, rate=0.04):
+    try:
+        t = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - t).total_seconds() / 3600
+        return np.exp(-rate * age)
+    except:
+        return 1.0
+
+def source_boost(source, local_query):
+    source = (source or "").lower()
+
+    if any(site in source for site in NEPALI_SITES):
+        return 1.25 if local_query else 0.9
+    return 1.0
+
 # =========================
-# FETCH NEWS
+# FETCH INTERNATIONAL NEWS
 # =========================
-def fetch_news(query, page_size=50):
+def fetch_international_news(query):
     url = "https://newsapi.org/v2/everything"
     params = {
         "q": query,
         "language": "en",
-        "pageSize": page_size,
+        "pageSize": ARTICLES_PER_QUERY,
         "sortBy": "publishedAt",
         "apiKey": NEWS_API_KEY
     }
 
-    response = requests.get(url, params=params)
-    data = response.json()
+    data = requests.get(url, params=params).json()
 
-    documents = {}
-    metadata = {}
+    docs, meta = {}, {}
     idx = 0
 
-    for article in data.get("articles", []):
-        title = article.get("title") or ""
-        desc = article.get("description") or ""
-        content = title + " " + desc
-
-        if not content.strip():
+    for a in data.get("articles", []):
+        text = (a.get("title") or "") + " " + (a.get("description") or "")
+        if not text.strip():
             continue
 
-        documents[idx] = content
-        metadata[idx] = {
-            "title": title,
-            "url": article.get("url"),
-            "source": article.get("source", {}).get("name"),
-            "publishedAt": article.get("publishedAt")
+        docs[idx] = text
+        meta[idx] = {
+            "title": a.get("title"),
+            "url": a.get("url"),
+            "source": a.get("source", {}).get("name"),
+            "publishedAt": a.get("publishedAt")
         }
         idx += 1
 
-    return documents, metadata
+    return docs, meta
 
 # =========================
-# TIME DECAY
+# FETCH NEPALI LOCAL NEWS
 # =========================
-def time_decay(published_at, decay_rate=0.04):
-    if not published_at:
-        return 1.0
+def fetch_nepal_news(query):
+    encoded = quote_plus(query)
+    docs, meta = {}, {}
+    idx = 0
 
-    published_time = datetime.fromisoformat(
-        published_at.replace("Z", "+00:00")
-    )
-    now = datetime.now(timezone.utc)
-    age_hours = (now - published_time).total_seconds() / 3600
+    for site in NEPALI_SITES:
+        rss = (
+            f"https://news.google.com/rss/search?"
+            f"q={encoded}+site:{site}&hl=en-NP&gl=NP&ceid=NP:en"
+        )
 
-    return np.exp(-decay_rate * age_hours)
+        feed = feedparser.parse(rss)
+
+        for e in feed.entries:
+            text = (e.get("title", "") + " " + e.get("summary", "")).strip()
+            if not text:
+                continue
+
+            docs[idx] = text
+            meta[idx] = {
+                "title": e.get("title"),
+                "url": e.get("link"),
+                "source": site,
+                "publishedAt": e.get("published")
+            }
+            idx += 1
+
+    return docs, meta
 
 # =========================
-# BUILD INVERTED INDEX
+# BUILD INDEX
 # =========================
-def build_index(documents):
+def build_index(docs):
     index = defaultdict(list)
-    doc_lengths = {}
-    total_terms = 0
+    lengths = {}
+    total = 0
 
-    for doc_id, text in documents.items():
+    for i, text in docs.items():
         terms = preprocess(text)
-        doc_lengths[doc_id] = len(terms)
-        total_terms += len(terms)
+        lengths[i] = len(terms)
+        total += len(terms)
 
         freq = defaultdict(int)
-        for term in terms:
-            freq[term] += 1
+        for t in terms:
+            freq[t] += 1
 
-        for term, f in freq.items():
-            index[term].append((doc_id, f))
+        for t, f in freq.items():
+            index[t].append((i, f))
 
-    avg_dl = total_terms / max(1, len(documents))
-    return index, doc_lengths, avg_dl
+    avg_dl = total / max(1, len(docs))
+    return index, lengths, avg_dl
 
 # =========================
 # BM25
 # =========================
-def score_BM25(query, index, doc_lengths, avg_dl, k1=1.5, b=0.75):
+def bm25(query, index, lengths, avg_dl):
     scores = defaultdict(float)
-    N = len(doc_lengths)
-    query_terms = preprocess(query)
+    N = len(lengths)
 
-    for term in query_terms:
+    for term in preprocess(query):
         if term not in index:
             continue
 
         df = len(index[term])
         idf = np.log((N - df + 0.5) / (df + 0.5) + 1)
 
-        for doc_id, f in index[term]:
-            denom = f + k1 * (1 - b + b * (doc_lengths[doc_id] / avg_dl))
-            scores[doc_id] += idf * (f * (k1 + 1)) / denom
+        for doc, f in index[term]:
+            denom = f + 1.5 * (1 - 0.75 + 0.75 * lengths[doc] / avg_dl)
+            scores[doc] += idf * (f * 2.5) / denom
 
     return scores
 
 # =========================
-# RM3 QUERY EXPANSION (SAFE)
-# =========================
-def expand_query_rm3(query, bm25_scores, documents, top_docs=10, top_terms=5):
-    if len(bm25_scores) < 3:
-        return query
-
-    ranked = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
-    top_docs = min(top_docs, len(ranked))
-
-    term_freq = defaultdict(int)
-    for doc_id, _ in ranked[:top_docs]:
-        for term in preprocess(documents[doc_id]):
-            term_freq[term] += 1
-
-    expansion_terms = sorted(term_freq.items(), key=lambda x: x[1], reverse=True)[:top_terms]
-    expanded_query = query + " " + " ".join(t for t, _ in expansion_terms)
-
-    return expanded_query
-
-# =========================
 # SEARCH PIPELINE
 # =========================
-def search_news(query):
-    print("\nFetching news...")
-    documents, metadata = fetch_news(query, ARTICLES_PER_QUERY)
+def search(query):
+    local_query = is_local_query(query)
 
-    if not documents:
-        print("No articles found.")
-        return
+    docs, meta = fetch_international_news(query)
 
-    index, doc_lengths, avg_dl = build_index(documents)
+    if local_query:
+        np_docs, np_meta = fetch_nepal_news(query)
+        offset = len(docs)
+        docs.update({k + offset: v for k, v in np_docs.items()})
+        meta.update({k + offset: v for k, v in np_meta.items()})
 
-    bm25_scores = score_BM25(query, index, doc_lengths, avg_dl)
-    expanded_query = expand_query_rm3(query, bm25_scores, documents)
-    rm3_scores = score_BM25(expanded_query, index, doc_lengths, avg_dl)
+    index, lengths, avg_dl = build_index(docs)
+    bm25_scores = bm25(query, index, lengths, avg_dl)
 
-    # FINAL SCORING (ALL DOCS)
     final_scores = {}
-    for doc_id in documents.keys():
-        bm25_score = rm3_scores.get(doc_id, 0)
-        decay = time_decay(metadata[doc_id]["publishedAt"])
-        final_scores[doc_id] = 0.7 * bm25_score + 0.3 * decay
+    for d in docs:
+        score = bm25_scores.get(d, 0)
+        decay = time_decay(meta[d]["publishedAt"])
+        boost = source_boost(meta[d]["source"], local_query)
+        final_scores[d] = boost * (0.7 * score + 0.3 * decay)
 
-    ranked_docs = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
-
-    # =========================
-    # PAGINATION (GOOGLE STYLE)
-    # =========================
-    total_results = len(ranked_docs)
-    total_pages = (total_results + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
-
-    print(f"\nAbout {total_results} results found\n")
+    ranked = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
 
     page = 1
+    total_pages = (len(ranked) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+
     while True:
         start = (page - 1) * RESULTS_PER_PAGE
         end = start + RESULTS_PER_PAGE
-        page_docs = ranked_docs[start:end]
+        batch = ranked[start:end]
 
-        if not page_docs:
+        if not batch:
             break
 
-        print(f"--- PAGE {page}/{total_pages} ---\n")
-        for rank, (doc_id, score) in enumerate(page_docs, start=start + 1):
-            print(f"{rank}. {metadata[doc_id]['title']}")
-            print(f"   Source: {metadata[doc_id]['source']}")
-            print(f"   URL: {metadata[doc_id]['url']}\n")
+        print(f"\n--- PAGE {page}/{total_pages} ---\n")
+        for i, (doc, _) in enumerate(batch, start=start + 1):
+            print(f"{i}. {meta[doc]['title']}")
+            print(f"   Source: {meta[doc]['source']}")
+            print(f"   URL: {meta[doc]['url']}\n")
 
-        cmd = input("Press Enter for next page or type 'q' to quit: ")
+        cmd = input("Enter = next page | q = quit: ")
         if cmd.lower() == "q":
             break
-
         page += 1
 
 # =========================
 # MAIN LOOP
 # =========================
 if __name__ == "__main__":
-    print("===== INTERNET NEWS SEARCH ENGINE =====")
+    print("===== NEWS SEARCH ENGINE =====")
 
     while True:
-        query = input("\nEnter search query (or 'exit'): ")
-        if query.lower() == "exit":
-            print("Goodbye!")
+        q = input("\nSearch (or 'exit'): ")
+        if q.lower() == "exit":
             break
-
-        search_news(query)
+        search(q)
