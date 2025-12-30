@@ -2,23 +2,23 @@ import requests
 import numpy as np
 import re
 from collections import defaultdict
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime, timezone
 
 # =========================
 # CONFIG
 # =========================
 NEWS_API_KEY = "12ad376c3d5c4134b493484d2711eb14"
 ARTICLES_PER_QUERY = 50
+RESULTS_PER_PAGE = 10 
 
 # =========================
 # PREPROCESSING
 # =========================
 def preprocess(text):
-    return re.findall(r'\b\w+\b', str(text).lower())
+    return re.findall(r"\b\w+\b", str(text).lower())
 
 # =========================
-# FETCH NEWS FROM INTERNET
+# FETCH NEWS
 # =========================
 def fetch_news(query, page_size=50):
     url = "https://newsapi.org/v2/everything"
@@ -26,6 +26,7 @@ def fetch_news(query, page_size=50):
         "q": query,
         "language": "en",
         "pageSize": page_size,
+        "sortBy": "publishedAt",
         "apiKey": NEWS_API_KEY
     }
 
@@ -34,17 +35,41 @@ def fetch_news(query, page_size=50):
 
     documents = {}
     metadata = {}
+    idx = 0
 
-    for i, article in enumerate(data.get("articles", [])):
-        content = (article["title"] or "") + " " + (article["description"] or "")
-        documents[i] = content
-        metadata[i] = {
-            "title": article["title"],
-            "url": article["url"],
-            "source": article["source"]["name"]
+    for article in data.get("articles", []):
+        title = article.get("title") or ""
+        desc = article.get("description") or ""
+        content = title + " " + desc
+
+        if not content.strip():
+            continue
+
+        documents[idx] = content
+        metadata[idx] = {
+            "title": title,
+            "url": article.get("url"),
+            "source": article.get("source", {}).get("name"),
+            "publishedAt": article.get("publishedAt")
         }
+        idx += 1
 
     return documents, metadata
+
+# =========================
+# TIME DECAY
+# =========================
+def time_decay(published_at, decay_rate=0.04):
+    if not published_at:
+        return 1.0
+
+    published_time = datetime.fromisoformat(
+        published_at.replace("Z", "+00:00")
+    )
+    now = datetime.now(timezone.utc)
+    age_hours = (now - published_time).total_seconds() / 3600
+
+    return np.exp(-decay_rate * age_hours)
 
 # =========================
 # BUILD INVERTED INDEX
@@ -60,17 +85,17 @@ def build_index(documents):
         total_terms += len(terms)
 
         freq = defaultdict(int)
-        for t in terms:
-            freq[t] += 1
+        for term in terms:
+            freq[term] += 1
 
         for term, f in freq.items():
             index[term].append((doc_id, f))
 
-    avg_dl = total_terms / len(documents)
+    avg_dl = total_terms / max(1, len(documents))
     return index, doc_lengths, avg_dl
 
 # =========================
-# BM25 SCORING
+# BM25
 # =========================
 def score_BM25(query, index, doc_lengths, avg_dl, k1=1.5, b=0.75):
     scores = defaultdict(float)
@@ -91,18 +116,22 @@ def score_BM25(query, index, doc_lengths, avg_dl, k1=1.5, b=0.75):
     return scores
 
 # =========================
-# RM3 QUERY EXPANSION
+# RM3 QUERY EXPANSION (SAFE)
 # =========================
-def expand_query_rm3(query, bm25_scores, documents, top_docs=5, top_terms=5):
-    top_documents = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)[:top_docs]
+def expand_query_rm3(query, bm25_scores, documents, top_docs=10, top_terms=5):
+    if len(bm25_scores) < 3:
+        return query
+
+    ranked = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)
+    top_docs = min(top_docs, len(ranked))
 
     term_freq = defaultdict(int)
-    for doc_id, _ in top_documents:
+    for doc_id, _ in ranked[:top_docs]:
         for term in preprocess(documents[doc_id]):
             term_freq[term] += 1
 
     expansion_terms = sorted(term_freq.items(), key=lambda x: x[1], reverse=True)[:top_terms]
-    expanded_query = query + " " + " ".join([t for t, _ in expansion_terms])
+    expanded_query = query + " " + " ".join(t for t, _ in expansion_terms)
 
     return expanded_query
 
@@ -110,7 +139,7 @@ def expand_query_rm3(query, bm25_scores, documents, top_docs=5, top_terms=5):
 # SEARCH PIPELINE
 # =========================
 def search_news(query):
-    print("\nFetching news from the internet...")
+    print("\nFetching news...")
     documents, metadata = fetch_news(query, ARTICLES_PER_QUERY)
 
     if not documents:
@@ -119,29 +148,58 @@ def search_news(query):
 
     index, doc_lengths, avg_dl = build_index(documents)
 
-    # BM25
     bm25_scores = score_BM25(query, index, doc_lengths, avg_dl)
-
-    # RM3
     expanded_query = expand_query_rm3(query, bm25_scores, documents)
     rm3_scores = score_BM25(expanded_query, index, doc_lengths, avg_dl)
 
-    ranked_docs = sorted(rm3_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+    # FINAL SCORING (ALL DOCS)
+    final_scores = {}
+    for doc_id in documents.keys():
+        bm25_score = rm3_scores.get(doc_id, 0)
+        decay = time_decay(metadata[doc_id]["publishedAt"])
+        final_scores[doc_id] = 0.7 * bm25_score + 0.3 * decay
 
-    print("\nTOP NEWS RESULTS (BM25 + RM3)\n")
-    for rank, (doc_id, score) in enumerate(ranked_docs, start=1):
-        print(f"{rank}. {metadata[doc_id]['title']}")
-        print(f"   Source: {metadata[doc_id]['source']}")
-        print(f"   URL: {metadata[doc_id]['url']}\n")
+    ranked_docs = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
 
+    # =========================
+    # PAGINATION (GOOGLE STYLE)
+    # =========================
+    total_results = len(ranked_docs)
+    total_pages = (total_results + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+
+    print(f"\nAbout {total_results} results found\n")
+
+    page = 1
+    while True:
+        start = (page - 1) * RESULTS_PER_PAGE
+        end = start + RESULTS_PER_PAGE
+        page_docs = ranked_docs[start:end]
+
+        if not page_docs:
+            break
+
+        print(f"--- PAGE {page}/{total_pages} ---\n")
+        for rank, (doc_id, score) in enumerate(page_docs, start=start + 1):
+            print(f"{rank}. {metadata[doc_id]['title']}")
+            print(f"   Source: {metadata[doc_id]['source']}")
+            print(f"   URL: {metadata[doc_id]['url']}\n")
+
+        cmd = input("Press Enter for next page or type 'q' to quit: ")
+        if cmd.lower() == "q":
+            break
+
+        page += 1
+
+# =========================
 # MAIN LOOP
+# =========================
 if __name__ == "__main__":
-    print("INTERNET NEWS SEARCH ENGINE")
+    print("===== INTERNET NEWS SEARCH ENGINE =====")
 
     while True:
-        user_query = input("\nEnter search query (or 'exit'): ")
-        if user_query.lower() == "exit":
+        query = input("\nEnter search query (or 'exit'): ")
+        if query.lower() == "exit":
             print("Goodbye!")
             break
 
-        search_news(user_query)
+        search_news(query)
